@@ -1,0 +1,268 @@
+import xml.etree.ElementTree as ET
+import zipfile
+import os
+import uuid
+from PIL import Image # For getting image dimensions (though not for sizing in this specific case)
+
+# --- Configuration ---
+DOCX_INPUT_PATH = "input.docx"  # Your existing DOCX file
+IMAGE_PATH = "my_image.jpg"    # The JPG image you want to add
+DOCX_OUTPUT_PATH = "output_a4_image.docx" # Changed output name
+
+# --- Helper: Register namespaces to keep them in the output XML ---
+NAMESPACES = {
+    'w': "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    'wp': "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    'a': "http://schemas.openxmlformats.org/drawingml/2006/main",
+    'pic': "http://schemas.openxmlformats.org/drawingml/2006/picture",
+    'r': "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+}
+
+for prefix, uri in NAMESPACES.items():
+    ET.register_namespace(prefix, uri)
+
+def add_image_to_docx(docx_path, image_path, output_docx_path):
+    # --- 1. Prepare image data ---
+    img_filename = os.path.basename(image_path)
+    img_media_path = f"word/media/{img_filename}" # Path inside the DOCX
+
+    # We still open the image to ensure it's valid, though its pixel dimensions
+    # won't be used for setting the display size in this A4 scenario.
+    try:
+        with Image.open(image_path):
+            pass # img_width_px, img_height_px = img.size (not needed for fixed A4 size)
+    except FileNotFoundError:
+        print(f"Error: Image file not found at {image_path}")
+        return
+    except Exception as e:
+        print(f"Error opening image: {e}")
+        return
+
+    # --- Set image display dimensions to A4 Landscape EMUs ---
+    # A4 width: 297mm, A4 height: 210mm (landscape)
+    # 1 inch = 25.4 mm
+    # 1 inch = 914400 EMUs
+    a4_landscape_width_mm = 297.0
+    a4_landscape_height_mm = 210.0
+
+    mm_to_inch_factor = 1.0 / 25.4
+    inch_to_emu_factor = 914400.0
+
+    # These are the target display dimensions for the image placeholder
+    img_width_emu = int(a4_landscape_width_mm * mm_to_inch_factor * inch_to_emu_factor)
+    img_height_emu = int(a4_landscape_height_mm * mm_to_inch_factor * inch_to_emu_factor)
+    # img_width_emu will be approx 10702294
+    # img_height_emu will be approx 7560000
+
+    # --- 2. Unpack DOCX and read relevant XMLs ---
+    # (This part remains the same as the original script)
+    temp_dir = "temp_docx_extracted" # Not strictly used if not extracting to disk
+    os.makedirs(temp_dir, exist_ok=True) # Still useful if debugging
+
+    other_files = {}
+    rels_content = None
+    doc_content = None
+
+    try:
+        with zipfile.ZipFile(docx_path, 'r') as docx_zip:
+            for member in docx_zip.namelist():
+                if member == "word/_rels/document.xml.rels":
+                    rels_content = docx_zip.read(member)
+                elif member == "word/document.xml":
+                    doc_content = docx_zip.read(member)
+                else:
+                    other_files[member] = docx_zip.read(member)
+            
+            # Ensure rels_content and doc_content were found
+            if rels_content is None:
+                # Handle case where default relationships file might not exist in a very minimal docx
+                # For a typical docx, it will exist. If not, create a minimal one.
+                # This is an edge case, most DOCX files will have this.
+                # For simplicity, we'll assume it exists based on typical DOCX structure.
+                print("Warning: word/_rels/document.xml.rels not found. Creating a new one.")
+                rels_root_element = ET.Element(f"{{{NAMESPACES['']}}}Relationships", xmlns=NAMESPACES['']) # Default namespace for Relationships
+                # Add standard rels if needed, or start empty for just the image.
+                # For now, let's assume it would have been created by Word. If a docx is truly empty of rels,
+                # adding one from scratch needs careful handling of default rels (styles, theme, etc.).
+                # A simpler approach if it's missing:
+                # rels_tree = ET.Element("Relationships", xmlns="http://schemas.openxmlformats.org/package/2006/relationships")
+                # rels_content = ET.tostring(rels_tree) -> but this needs careful thought on default relationships for a valid DOCX
+                # Better to ensure the input DOCX is valid and contains it.
+                # If input.docx is created by python-docx, it WILL have this file.
+                # So, we will error out if not found, as it implies a malformed input docx.
+                 raise KeyError("word/_rels/document.xml.rels not found in DOCX.")
+
+            if doc_content is None:
+                 raise KeyError("word/document.xml not found in DOCX.")
+
+
+    except FileNotFoundError:
+        print(f"Error: DOCX file not found at {docx_path}")
+        # No need to clean temp_dir if it wasn't substantially used.
+        return
+    except KeyError as e:
+        print(f"Error: Essential XML file missing from DOCX: {e}")
+        return
+    except Exception as e:
+        print(f"Error reading DOCX: {e}")
+        return
+
+    # --- 3. Modify word/_rels/document.xml.rels ---
+    rels_tree = ET.fromstring(rels_content)
+    rels_root = rels_tree # If rels_tree is already the root
+
+    # Find the next available rId
+    # Namespace for finding Relationship elements is the default one for <Relationships>
+    # which is "http://schemas.openxmlformats.org/package/2006/relationships"
+    # However, ET.fromstring doesn't automatically assign a prefix for the default namespace
+    # when finding. So, we either use the full {uri}tag or findall("*") and check tags.
+    # Let's assume rels_root.findall("Relationship") works if no default namespace was on Relationships
+    # If Relationships has xmlns="...", then use "{http...}Relationship"
+    
+    # Correctly find relationships using its namespace if it's the default one
+    relationship_tag = "Relationship"
+    # The xmlns for relationships is typically http://schemas.openxmlformats.org/package/2006/relationships
+    # This namespace is not in our NAMESPACES dict, as it's for the rels file itself.
+    rels_ns_uri = "http://schemas.openxmlformats.org/package/2006/relationships"
+    if rels_root.tag.startswith(f"{{{rels_ns_uri}}}"): # Check if root has this default NS
+        relationship_tag = f"{{{rels_ns_uri}}}Relationship"
+    
+    rids = []
+    # Iterate through children of rels_root, as findall might behave differently with default ns
+    for rel_element in rels_root: # Iterating children is safer for default namespaces
+        if rel_element.tag == relationship_tag or rel_element.tag == "Relationship": # Fallback if NS not detected
+            r_id_val = rel_element.get('Id')
+            if r_id_val and r_id_val.startswith('rId'):
+                try:
+                    rids.append(int(r_id_val[3:]))
+                except ValueError:
+                    pass # If rId is not like rId123
+
+    new_rid_num = max(rids) + 1 if rids else 1
+    new_rid = f"rId{new_rid_num}"
+
+    # Add new relationship for the image
+    new_rel_element = ET.SubElement(rels_root, relationship_tag if rels_root.tag.startswith("{") else "Relationship")
+    new_rel_element.set("Id", new_rid)
+    new_rel_element.set("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image")
+    new_rel_element.set("Target", f"media/{img_filename}")
+
+    # Ensure the Relationships element itself has the correct xmlns if we created it or modified it
+    # For ET, if the root tag was parsed with ns, it will be serialized with it.
+    if not rels_root.tag.startswith("{") and "xmlns" not in rels_root.attrib:
+        rels_root.set("xmlns", rels_ns_uri)
+
+
+    modified_rels_content = ET.tostring(rels_root, encoding="UTF-8", xml_declaration=True)
+
+    # --- 4. Modify word/document.xml ---
+    doc_tree = ET.fromstring(doc_content)
+    doc_root = doc_tree
+    body = doc_root.find("w:body", NAMESPACES)
+    if body is None:
+        print("Error: <w:body> tag not found in document.xml")
+        return
+
+    docpr_id = str(uuid.uuid4().int & ((1<<31)-1))[:8] # Random positive int string (max 8 digits)
+    cnvpr_id = str(uuid.uuid4().int & ((1<<31)-1))[:8] # Another one
+
+    p = ET.SubElement(body, f"{{{NAMESPACES['w']}}}p")
+    r_run = ET.SubElement(p, f"{{{NAMESPACES['w']}}}r") # Renamed to avoid clash with 'r' namespace prefix
+    drawing = ET.SubElement(r_run, f"{{{NAMESPACES['w']}}}drawing")
+
+    inline = ET.SubElement(drawing, f"{{{NAMESPACES['wp']}}}inline",
+                           distT="0", distB="0", distL="0", distR="0")
+
+    extent = ET.SubElement(inline, f"{{{NAMESPACES['wp']}}}extent",
+                           cx=str(img_width_emu), cy=str(img_height_emu))
+    effectExtent = ET.SubElement(inline, f"{{{NAMESPACES['wp']}}}effectExtent",
+                                 l="0", t="0", r="0", b="0")
+    docPr = ET.SubElement(inline, f"{{{NAMESPACES['wp']}}}docPr",
+                          id=docpr_id, name=f"Picture {new_rid_num}", descr=img_filename)
+    cNvGraphicFramePr = ET.SubElement(inline, f"{{{NAMESPACES['wp']}}}cNvGraphicFramePr")
+    graphicFrameLocks = ET.SubElement(cNvGraphicFramePr, f"{{{NAMESPACES['a']}}}graphicFrameLocks")
+    # `noChangeAspect` is NOT a namespaced attribute here.
+    graphicFrameLocks.set("noChangeAspect", "1")
+
+
+    graphic = ET.SubElement(inline, f"{{{NAMESPACES['a']}}}graphic")
+    graphicData = ET.SubElement(graphic, f"{{{NAMESPACES['a']}}}graphicData",
+                                uri="http://schemas.openxmlformats.org/drawingml/2006/picture")
+
+    pic_el = ET.SubElement(graphicData, f"{{{NAMESPACES['pic']}}}pic") # Renamed to avoid clash
+    nvPicPr = ET.SubElement(pic_el, f"{{{NAMESPACES['pic']}}}nvPicPr")
+    cNvPr = ET.SubElement(nvPicPr, f"{{{NAMESPACES['pic']}}}cNvPr",
+                          id=cnvpr_id, name=img_filename)
+    cNvPicScPr = ET.SubElement(nvPicPr, f"{{{NAMESPACES['pic']}}}cNvPicScPr")
+
+    blipFill = ET.SubElement(pic_el, f"{{{NAMESPACES['pic']}}}blipFill")
+    blip = ET.SubElement(blipFill, f"{{{NAMESPACES['a']}}}blip")
+    blip.set(f"{{{NAMESPACES['r']}}}embed", new_rid)
+    stretch = ET.SubElement(blipFill, f"{{{NAMESPACES['a']}}}stretch")
+    fillRect = ET.SubElement(stretch, f"{{{NAMESPACES['a']}}}fillRect")
+
+    spPr = ET.SubElement(pic_el, f"{{{NAMESPACES['pic']}}}spPr")
+    xfrm = ET.SubElement(spPr, f"{{{NAMESPACES['a']}}}xfrm")
+    off = ET.SubElement(xfrm, f"{{{NAMESPACES['a']}}}off", x="0", y="0")
+    ext = ET.SubElement(xfrm, f"{{{NAMESPACES['a']}}}ext",
+                        cx=str(img_width_emu), cy=str(img_height_emu))
+    prstGeom = ET.SubElement(spPr, f"{{{NAMESPACES['a']}}}prstGeom", prst="rect")
+    avLst = ET.SubElement(prstGeom, f"{{{NAMESPACES['a']}}}avLst")
+
+
+    modified_doc_content = ET.tostring(doc_root, encoding="UTF-8", xml_declaration=True)
+
+    # --- 5. Re-zip into new DOCX ---
+    with zipfile.ZipFile(output_docx_path, 'w', zipfile.ZIP_DEFLATED) as docx_out:
+        docx_out.writestr("word/_rels/document.xml.rels", modified_rels_content)
+        docx_out.writestr("word/document.xml", modified_doc_content)
+        docx_out.write(image_path, img_media_path)
+        for filename, content_bytes in other_files.items(): # ensure content is bytes
+            docx_out.writestr(filename, content_bytes)
+
+    print(f"Image '{img_filename}' added with A4 landscape dimensions. Output saved to '{output_docx_path}'")
+
+    # Clean up (optional)
+    # import shutil
+    # if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    if not os.path.exists(DOCX_INPUT_PATH):
+        print(f"Creating dummy '{DOCX_INPUT_PATH}'...")
+        try:
+            from docx import Document
+            doc = Document()
+            doc.add_paragraph("This is the initial document.")
+            doc.add_paragraph("An image will be added below, sized as A4 landscape.")
+            doc.save(DOCX_INPUT_PATH)
+            print(f"Dummy '{DOCX_INPUT_PATH}' created.")
+        except ImportError:
+            print("python-docx is not installed. Cannot create a dummy input.docx.")
+            print(f"Please create '{DOCX_INPUT_PATH}' manually or install python-docx (`pip install python-docx`)")
+
+
+    if not os.path.exists(IMAGE_PATH):
+        print(f"Creating dummy '{IMAGE_PATH}'...")
+        try:
+            from PIL import Image, ImageDraw
+            # Create an image with a different aspect ratio than A4 to see the stretching
+            img_pil = Image.new('RGB', (400, 400), color = 'blue') # Square image
+            d = ImageDraw.Draw(img_pil)
+            d.text((10,10), "Sample JPG (will be stretched to A4)", fill=(255,255,0))
+            img_pil.save(IMAGE_PATH, "JPEG")
+            print(f"Dummy '{IMAGE_PATH}' created.")
+        except ImportError:
+            print("Pillow is not installed. Cannot create a dummy image.")
+            print(f"Please create '{IMAGE_PATH}' manually or install Pillow (`pip install Pillow`)")
+        except Exception as e:
+            print(f"Error creating dummy image: {e}")
+
+    if os.path.exists(DOCX_INPUT_PATH) and os.path.exists(IMAGE_PATH):
+        add_image_to_docx(DOCX_INPUT_PATH, IMAGE_PATH, DOCX_OUTPUT_PATH)
+    else:
+        if not os.path.exists(DOCX_INPUT_PATH):
+            print(f"Input DOCX '{DOCX_INPUT_PATH}' not found.")
+        if not os.path.exists(IMAGE_PATH):
+            print(f"Image '{IMAGE_PATH}' not found.")
